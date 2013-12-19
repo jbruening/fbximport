@@ -80,7 +80,7 @@ def elem_repr(elem):
         ", ".join([repr(p) for p in elem.props]),
         # elem.props_type,
         b", ".join([e.id for e in elem.elems]),
-        )
+    )
 
 
 def elem_split_name_class(elem):
@@ -129,6 +129,13 @@ def elem_props_find_first(elem, elem_prop_id):
     for subelem in elem.elems:
         assert(subelem.id == b'P')
         if subelem.props[0] == elem_prop_id:
+            return subelem
+    return None
+
+
+def elems_find_first(elem, elem_prop_id):
+    for subelem in elem.elems:
+        if subelem.id == elem_prop_id:
             return subelem
     return None
 
@@ -234,6 +241,21 @@ def blen_read_object(fbx_tmpl, fbx_obj, object_data):
 
     obj.color[0:3] = elem_props_get_color_rgb(fbx_props, b'Color', (0.8, 0.8, 0.8))
 
+    matrix = blen_read_transform_matrix(fbx_tmpl, fbx_obj, obj.type)
+
+    obj.matrix_basis = matrix
+
+    return obj
+
+
+def blen_read_transform_matrix(fbx_tmpl, fbx_obj, obj_type='DEFAULT'):
+    const_vector_zero_3d = 0.0, 0.0, 0.0
+    const_vector_one_3d = 1.0, 1.0, 1.0
+
+    fbx_props = (elem_find_first(fbx_obj, b'Properties70'),
+                 elem_find_first(fbx_tmpl, b'Properties70', fbx_elem_nil))
+    assert(fbx_props[0] is not None)
+
     # ----
     # Transformation
 
@@ -274,9 +296,9 @@ def blen_read_object(fbx_tmpl, fbx_obj, object_data):
     lcl_translation = Matrix.Translation(loc)
 
     # rotation
-    if obj.type == 'CAMERA':
+    if obj_type == 'CAMERA':
         rot_alt_mat = Matrix.Rotation(pi / -2.0, 4, 'Y')
-    elif obj.type == 'LAMP':
+    elif obj_type == 'LAMP':
         rot_alt_mat = Matrix.Rotation(pi / -2.0, 4, 'X')
     else:
         rot_alt_mat = Matrix()
@@ -295,7 +317,7 @@ def blen_read_object(fbx_tmpl, fbx_obj, object_data):
     lcl_scale = Matrix()
     lcl_scale[0][0], lcl_scale[1][1], lcl_scale[2][2] = sca
 
-    obj.matrix_basis = (
+    return (
         lcl_translation *
         rot_ofs *
         rot_piv *
@@ -308,9 +330,6 @@ def blen_read_object(fbx_tmpl, fbx_obj, object_data):
         lcl_scale *
         sca_piv.inverted()
         )
-
-    return obj
-
 
 # ----
 # Mesh
@@ -538,6 +557,7 @@ def blen_read_geom_layer_color(fbx_obj, mesh):
                 fbx_layer_mapping, fbx_layer_ref,
                 4, 3, layer_id,
                 )
+
 
 def blen_read_geom_layer_smooth(fbx_obj, mesh):
     fbx_layer = elem_find_first(fbx_obj, b'LayerElementSmoothing')
@@ -981,6 +1001,25 @@ def load(operator, context, filepath="",
     _(); del _
 
     # ----
+    # Connection lookup helpers
+    def connection_filter_ex(fbx_uuid, fbx_id, dct):
+        return [(c_found[0], c_found[1], c_type)
+                for (c_uuid, c_type) in dct.get(fbx_uuid, ())
+                # 0 is used for the root node, which isnt in fbx_table_nodes
+                for c_found in (() if c_uuid is 0 else (fbx_table_nodes[c_uuid],))
+                if (fbx_id is None) or (c_found[0].id == fbx_id)]
+
+    def connection_filter_forward(fbx_uuid, fbx_id):
+        return connection_filter_ex(fbx_uuid, fbx_id, fbx_connection_map)
+
+    def connection_filter_reverse(fbx_uuid, fbx_id):
+        return connection_filter_ex(fbx_uuid, fbx_id, fbx_connection_map_reverse)
+
+    #---
+    # all objects, templates, and connection maps set up. Now actually do something with them
+    #---
+
+    # ----
     # Load mesh data
     def _():
         fbx_tmpl = fbx_template_get((b'Geometry', b'KFbxMesh'))
@@ -1050,20 +1089,8 @@ def load(operator, context, filepath="",
                 fbx_item[1] = blen_read_light(fbx_tmpl, fbx_obj, global_scale)
     _(); del _
 
-    # ----
-    # Connections
-    def connection_filter_ex(fbx_uuid, fbx_id, dct):
-        return [(c_found[0], c_found[1], c_type)
-                for (c_uuid, c_type) in dct.get(fbx_uuid, ())
-                # 0 is used for the root node, which isnt in fbx_table_nodes
-                for c_found in (() if c_uuid is 0 else (fbx_table_nodes[c_uuid],))
-                if (fbx_id is None) or (c_found[0].id == fbx_id)]
-
-    def connection_filter_forward(fbx_uuid, fbx_id):
-        return connection_filter_ex(fbx_uuid, fbx_id, fbx_connection_map)
-
-    def connection_filter_reverse(fbx_uuid, fbx_id):
-        return connection_filter_ex(fbx_uuid, fbx_id, fbx_connection_map_reverse)
+    root_bone_nodes = {}
+    armature_skins = {}
 
     def _():
         fbx_tmpl = fbx_template_get((b'Model', b'KFbxNode'))
@@ -1075,12 +1102,70 @@ def load(operator, context, filepath="",
             if fbx_obj.id != b'Model':
                 continue
 
+
+            # print(fbx_obj.props[2])
+
             # Create empty object or search for object data
             if fbx_obj.props[2] == b'Null':
                 fbx_lnk_item = None
                 ok = True
+
+            elif fbx_obj.props[2].startswith(b'Limb'):
+                # find all the root bone objects
+                # don't create objects for these
+                ok = False
+                fbx_lnk_item = None
+
+                # print("going to root of ", elem_split_name_class(fbx_obj))
+                root_obj = fbx_obj
+                root_skin = None
+
+                while True:
+                    # do we have a cluster? if so, grab the skin associated with us
+                    for (fbx_lnk,
+                         fbx_lnk_item,
+                         fbx_lnk_type) in connection_filter_forward(elem_uuid(root_obj), b'Deformer'):
+
+                        #print('cluster ', elem_uuid(fbx_lnk))
+                        if fbx_lnk.props[2] != b'Cluster':
+                            continue
+
+                        for (fbx_lnk_skn,
+                                fbx_lnk_item_skn,
+                                fbx_lnk_type_skn) in connection_filter_forward(elem_uuid(fbx_lnk), b'Deformer'):
+                            if fbx_lnk_skn.props[2] == b'Skin':
+                                #print('skin ', elem_uuid(fbx_lnk_skn))
+                                root_skin = fbx_lnk_skn
+
+                    for (fbx_lnk,
+                         fbx_lnk_item,
+                         fbx_lnk_type) in connection_filter_forward(elem_uuid(root_obj), b'Model'):
+
+                        #print(elem_uuid(root_obj))
+                        if fbx_lnk.props[2].startswith(b'Limb'):
+                            root_obj = fbx_lnk
+                            break
+                    else:
+                        #ran out of parents
+                        break
+
+                #make an entry in armature_skin
+                if not root_obj.props[0] in root_bone_nodes:
+                    print('adding ', elem_uuid(root_obj), ' to root bones')
+                    root_bone_nodes[elem_uuid(root_obj)] = [root_obj, None]
+                    if root_skin is None:
+                        print('no root skin found')
+                    else:
+                        rt_skn_uuid = elem_uuid(root_skin)
+                        print('associating with skin ', rt_skn_uuid)
+                        if rt_skn_uuid in armature_skins:
+                            armature_skins[rt_skn_uuid].add(root_obj)
+                        else:
+                            armature_skins[rt_skn_uuid] = [root_obj]
+
             else:
                 ok = False
+                #get mesh data via searching through link items
                 for (fbx_lnk,
                      fbx_lnk_item,
                      fbx_lnk_type) in connection_filter_reverse(fbx_uuid, None):
@@ -1092,7 +1177,7 @@ def load(operator, context, filepath="",
                     if isinstance(fbx_lnk_item, (bpy.types.Material, bpy.types.Image)):
                         continue
                     # Need to check why this happens, Bird_Leg.fbx
-                    if isinstance(fbx_lnk_item, (bpy.types.Object)):
+                    if isinstance(fbx_lnk_item, bpy.types.Object):
                         continue
                     ok = True
                     break
@@ -1109,10 +1194,110 @@ def load(operator, context, filepath="",
 
                 objects.append(obj)
 
+
+
+    _(); del _
+
+    # ----
+    # Armatures
+    def _():
+        fbx_tmpl = fbx_template_get((b'Model', b'KFbxNode'))
+
+        objects = []
+
+
+        for arm_uuid, fbx_item in root_bone_nodes.items():
+            fbx_arm, blen_data = fbx_item
+            # TODO: determine if the armature object should be this node, or a new object (with this bone as root bone)
+            # should be based on if the root bone has a deformation cluster associated with it, and the cluster's parent
+            # no deformation with no other roots in its Skin
+            # means its probably from blender, and should be the object
+            # has deformation? make a new object, or search for an existing one for the Deformation Skin
+            # if some other root has no deformation, in the same skin,
+            # means this is just a secondary root for an armature
+            # maybe have options for 'aggressive combine' and 'don't combine' or something?
+            # also needs changes to exporter to support exporting without having the armature object be root
+            # (ie: ignore it)
+            arm_name = elem_split_name_class(fbx_arm)[0].decode('utf-8')
+            armature = bpy.data.armatures.new(arm_name)
+
+            obj = blen_read_object(fbx_tmpl, fbx_arm, armature)
+
+            # some visual stuff first..
+            obj.show_x_ray = True
+            armature.draw_type = 'STICK'
+
+            assert(fbx_item[1] is None)
+            fbx_item[1] = obj
+
+            # instance in scene
+            obj_base = scene.objects.link(obj)
+            obj_base.select = True
+
+            objects.append(obj)
+
+            # made the armature object. now enter edit mode...
+
+            scene.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+
+            # depth-first traversal
+            queue = [fbx_arm]
+            parents = []
+
+            all_bones = []
+
+            while queue:
+                queue_node = queue.pop()
+
+                elem_name = elem_split_name_class(queue_node)[0].decode('utf-8')
+                print(elem_name)
+
+                eb = armature.edit_bones.new(elem_name)
+                all_bones.append(eb)
+                matrix = blen_read_transform_matrix(fbx_tmpl, queue_node)
+
+                from mathutils import Vector
+
+                #Global matrix rotation need only be applied on root bones
+                if len(parents) > 0:
+                    #as the matrices from fbx are relative to their parents, they need to first by modified by that
+                    eb.parent = parents.pop()
+                    matrix = eb.parent.matrix * matrix
+                elif not global_matrix is None:
+                    # this fixes global rotation, not scale though...
+                    matrix = global_matrix * matrix
+
+                #todo: fix global scale on bones
+
+                pos = matrix.to_translation()
+                rot = matrix.to_quaternion()
+
+                #this will correctly slide and rotate the bone to match the original matrix
+                eb.head = Vector([0, 0, 0])
+                # keeping bones short, as the axis might be different from what blender used to
+                # bones are more like empties in fbx, and could be 'rotated strangely'
+                eb.tail = Vector([0, 0.2, 0])
+                eb.transform(rot.to_matrix())
+                eb.translate(pos)
+
+                # traverse children
+                for (fbx_lnk,
+                     fbx_lnk_item,
+                     fbx_lnk_type) in connection_filter_reverse(elem_uuid(queue_node), b'Model'):
+
+                    if queue_node.props[2].startswith(b'Limb'):
+                        parents.append(eb)
+                        queue.append(fbx_lnk)
+
+            # finalize bone additions
+            bpy.ops.object.mode_set(mode='OBJECT')
+
     _(); del _
 
     def _():
         # Parent objects, after we created them...
+
         for fbx_uuid, fbx_item in fbx_table_nodes.items():
             fbx_obj, blen_data = fbx_item
             if fbx_obj.id != b'Model':
@@ -1139,6 +1324,152 @@ def load(operator, context, filepath="",
 
                 if fbx_item[1].parent is None:
                     fbx_item[1].matrix_basis = global_matrix * fbx_item[1].matrix_basis
+    _(); del _
+
+    # ----
+    # Load deformer data
+    # deformation data needs to be read after we actually make the objects and armatures
+    # TODO: should this be done before or after applying global matrix?
+    # seems to work properly after matrix...
+    def _():
+        # no fbx files seem to have a sub template for Deformer.Skin
+        fbx_tmpl = fbx_template_get((b'Deformer', b'KFbxSkin'))
+
+        for fbx_uuid, fbx_item in fbx_table_nodes.items():
+            fbx_obj, blen_data = fbx_item
+            if fbx_obj.id != b'Deformer':
+                continue
+            if fbx_obj.props[-1] == b'Skin':
+                #this is the parent of some Cluster objects
+                #print("skin data for ", fbx_uuid)
+                continue
+            if fbx_obj.props[-1] == b'Cluster':
+                print('cluster data for ', fbx_uuid)
+                #get the skin...
+
+                obj = None
+
+                for (fbx_lnk_skn,
+                     fbx_lnk_item_skn,
+                     fbx_lnk_type_skn) in connection_filter_forward(fbx_uuid, b'Deformer'):
+
+                    if fbx_lnk_type_skn.props[0] != b'OO':
+                        continue
+                    if fbx_lnk_skn.props[-1] != b'Skin':
+                        continue
+
+                    for (fbx_lnk_geo,
+                         fbx_lnk_item_geo,
+                         fbx_lnk_type_geo) in connection_filter_forward(elem_uuid(fbx_lnk_skn), b'Geometry'):
+
+                        if fbx_lnk_geo.props[-1] != b'Mesh':
+                            continue
+                        if fbx_lnk_type_geo.props[0] != b'OO':
+                            continue
+
+                        for (fbx_lnk_obj,
+                             fbx_lnk_item_obj,
+                             fbx_lnk_type_obj) in connection_filter_forward(elem_uuid(fbx_lnk_geo), b'Model'):
+
+                            if fbx_lnk_obj.props[-1] != b'Mesh':
+                                continue
+                            if fbx_lnk_type_obj.props[0] != b'OO':
+                                continue
+                            if fbx_lnk_item_obj is None:
+                                continue
+                            obj = fbx_lnk_item_obj
+                            break
+                        break
+                    break
+
+                if obj is None:
+                    continue
+
+                # lets perform the stuff we need to do not so deep
+                # get our bone
+                fbx_bone = None
+
+                for (fbx_lnk,
+                     fbx_lnk_item,
+                     fbx_lnk_type) in connection_filter_reverse(fbx_uuid, b'Model'):
+
+                    #print('cluster ', elem_uuid(fbx_lnk))
+                    if not fbx_lnk.props[-1].startswith(b'Limb'):
+                        continue
+                    fbx_bone = fbx_lnk
+
+                if fbx_bone is None:
+                    continue
+
+                group_name = elem_split_name_class(fbx_bone)[0].decode('utf-8')
+
+                group = obj.vertex_groups.new(group_name)
+
+                index_elem = elems_find_first(fbx_obj, b'Indexes')
+                weights_elem = elems_find_first(fbx_obj, b'Weights')
+
+                if index_elem is None or weights_elem is None:
+                    continue
+
+                indexes = index_elem.props[0]
+                weights = weights_elem.props[0]
+
+                assert (blen_data is None)
+
+                #set weighting info
+                for idx, val in enumerate(indexes):
+                    group.add([val], weights[idx], 'REPLACE')
+
+                fbx_item[1] = group
+
+    _(); del _
+
+    # ----
+    # associate deforming armatures with objects
+    def _():
+
+        for skin_uuid, arm_fbx in armature_skins.items():
+            if arm_fbx is None:
+                continue
+            fbx_skin = fbx_table_nodes[skin_uuid]
+            if fbx_skin is None:
+                continue
+
+            model_obj = None
+            for (fbx_lnk_geo,
+                 fbx_lnk_item_geo,
+                 fbx_lnk_type_geo) in connection_filter_forward(skin_uuid, b'Geometry'):
+
+                if fbx_lnk_geo.props[-1] != b'Mesh':
+                    continue
+                if fbx_lnk_type_geo.props[0] != b'OO':
+                    continue
+
+                for (fbx_lnk_obj,
+                     fbx_lnk_item_obj,
+                     fbx_lnk_type_obj) in connection_filter_forward(elem_uuid(fbx_lnk_geo), b'Model'):
+
+                    if fbx_lnk_obj.props[-1] != b'Mesh':
+                        continue
+                    if fbx_lnk_type_obj.props[0] != b'OO':
+                        continue
+                    if fbx_lnk_item_obj is None:
+                        continue
+                    model_obj = fbx_lnk_item_obj
+                    break
+                break
+
+            if model_obj is None:
+                continue
+            # get the armature object
+            armature = root_bone_nodes[elem_uuid(arm_fbx[0])]
+            if armature is None:
+                continue
+            arm_obj = armature[1]
+            if arm_obj is None:
+                continue
+            arm_mod = model_obj.modifiers.new('Armature', 'ARMATURE')
+            arm_mod.object = arm_obj
     _(); del _
 
     def _():
